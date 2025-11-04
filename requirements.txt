@@ -1,0 +1,10 @@
+# Dependências para o aplicativo de Controle de Crescimento Infantil
+
+# Framework web para aplicações Python
+streamlit>=1.28.0
+
+# Biblioteca para manipulação e análise de dados
+pandas>=2.0.0
+
+# Biblioteca para criação de gráficos interativos
+plotly>=5.15.0
