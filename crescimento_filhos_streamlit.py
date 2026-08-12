@@ -4,6 +4,82 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# Usar st.secrets["DB_URL"] em produção para não expor credenciais
+DB_URL = "postgresql://neondb_owner:npg_RsPJfa6NwK5n@ep-polished-sky-acbm865c.sa-east-1.aws.neon.tech/neondb?sslmode=require"
+
+
+def _get_db_conn():
+    return psycopg2.connect(DB_URL)
+
+
+def init_db():
+    with _get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS "Medida" (
+                    "Nome"   VARCHAR(100) NOT NULL,
+                    "Sexo"   VARCHAR(20)  NOT NULL,
+                    "Idade"  INTEGER      NOT NULL,
+                    "Altura" NUMERIC(5,1) NOT NULL,
+                    "Data"   DATE         NOT NULL,
+                    PRIMARY KEY ("Nome", "Idade", "Data")
+                )
+            """)
+
+
+def db_inserir_medida(nome, sexo, idade_meses, altura, data):
+    with _get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                'INSERT INTO "Medida" ("Nome","Sexo","Idade","Altura","Data") '
+                'VALUES (%s,%s,%s,%s,%s) '
+                'ON CONFLICT ("Nome","Idade","Data") DO UPDATE '
+                'SET "Altura"=EXCLUDED."Altura", "Sexo"=EXCLUDED."Sexo"',
+                (nome, sexo, idade_meses, altura, data)
+            )
+
+
+def db_excluir_medida(nome, idade_meses, data):
+    with _get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                'DELETE FROM "Medida" WHERE "Nome"=%s AND "Idade"=%s AND "Data"=%s',
+                (nome, idade_meses, data)
+            )
+
+
+def db_atualizar_medida(nome, sexo, old_idade, old_data, new_idade, new_altura):
+    with _get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                'UPDATE "Medida" SET "Idade"=%s, "Altura"=%s '
+                'WHERE "Nome"=%s AND "Idade"=%s AND "Data"=%s',
+                (new_idade, new_altura, nome, old_idade, old_data)
+            )
+
+
+def importar_json_para_db():
+    try:
+        with open('dados_crescimento.json', 'r') as f:
+            criancas = json.load(f)
+        with _get_db_conn() as conn:
+            with conn.cursor() as cur:
+                for c in criancas:
+                    for m in c['medidas']:
+                        cur.execute(
+                            'INSERT INTO "Medida" ("Nome","Sexo","Idade","Altura","Data") '
+                            'VALUES (%s,%s,%s,%s,%s) '
+                            'ON CONFLICT ("Nome","Idade","Data") DO UPDATE '
+                            'SET "Altura"=EXCLUDED."Altura", "Sexo"=EXCLUDED."Sexo"',
+                            (c['nome'], c['sexo'], m['idade_meses'], m['altura'], m['data'])
+                        )
+        return True
+    except Exception as e:
+        return str(e)
+
 
 # Dados dos quartis de crescimento (altura em cm)
 
@@ -131,6 +207,11 @@ def main():
     st.title("📏 Controle de Crescimento Infantil")
     st.write("Acompanhe o crescimento dos seus filhos com base nos quartis de crescimento da OMS")
     
+    try:
+        init_db()
+    except Exception as e:
+        st.error(f"Erro ao conectar ao banco de dados: {e}")
+
     inicializar_dados()
     carregar_dados()
     
@@ -138,6 +219,14 @@ def main():
     st.sidebar.title("Menu")
     opcao = st.sidebar.selectbox("Escolha uma opção:", 
                                 ["Cadastrar Criança", "Registrar Medida", "Editar Medidas", "Visualizar Gráfico"])
+
+    st.sidebar.write("---")
+    if st.sidebar.button("📤 Enviar JSON para o Banco de Dados"):
+        resultado = importar_json_para_db()
+        if resultado is True:
+            st.sidebar.success("Dados enviados com sucesso!")
+        else:
+            st.sidebar.error(f"Erro ao enviar: {resultado}")
     
     if opcao == "Cadastrar Criança":
         st.header("👶 Cadastrar Nova Criança")
@@ -199,6 +288,10 @@ def main():
                         break
                 
                 salvar_dados()
+                crianca_reg = next((c for c in st.session_state.criancas if c['nome'] == nome_selecionado), None)
+                if crianca_reg:
+                    db_inserir_medida(nome_selecionado, crianca_reg['sexo'],
+                                      idade_total_meses, altura, nova_medida['data'])
                 st.success("Medida registrada com sucesso!")
     
     elif opcao == "Editar Medidas":
@@ -237,6 +330,7 @@ def main():
                 
                 with col4:
                     if st.button("🗑️ Excluir", key=f"delete_{i}"):
+                        db_excluir_medida(crianca['nome'], medida['idade_meses'], medida['data'])
                         crianca['medidas'].pop(i)
                         salvar_dados()
                         st.success("Medida excluída com sucesso!")
@@ -276,11 +370,16 @@ def main():
                                 if nova_idade_total > 120:
                                     st.error("Idade máxima é 10 anos (120 meses).")
                                 else:
+                                    old_idade = medida['idade_meses']
+                                    old_data = medida['data']
                                     medida['idade_meses'] = nova_idade_total
                                     medida['altura'] = nova_altura
                                     # Reordenar por idade
                                     crianca['medidas'].sort(key=lambda x: x['idade_meses'])
                                     salvar_dados()
+                                    db_atualizar_medida(crianca['nome'], crianca['sexo'],
+                                                        old_idade, old_data,
+                                                        nova_idade_total, nova_altura)
                                     st.session_state[f'editando_{i}'] = False
                                     st.success("Medida atualizada com sucesso!")
                                     st.rerun()
@@ -341,6 +440,8 @@ def main():
                 with col2:
                     if st.button("🗑️ Excluir Selecionada", key="btn_excluir_rapido"):
                         if medida_para_excluir != -1:
+                            medida_exc = crianca['medidas'][medida_para_excluir]
+                            db_excluir_medida(crianca['nome'], medida_exc['idade_meses'], medida_exc['data'])
                             crianca['medidas'].pop(medida_para_excluir)
                             salvar_dados()
                             st.success("Medida excluída com sucesso!")
@@ -352,4 +453,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
